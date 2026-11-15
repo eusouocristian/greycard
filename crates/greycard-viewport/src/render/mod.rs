@@ -374,6 +374,18 @@ struct Scopes {
     /// image, changes.
     analyzed: Option<(EditKey, Scope, Option<usize>)>,
     image_changed: bool,
+    /// The pre-curve histogram for the curve editor's backdrop, keyed
+    /// without the edited curve so moving curve points does not shift
+    /// the histogram behind them.
+    curve_bins: gpu::Buffer,
+    curve_staging: gpu::Buffer,
+    curve_mode: gpu::Buffer,
+    curve_analysis: Option<gpu::Texture>,
+    curve_in_flight: Option<std::sync::mpsc::Receiver<Result<(), gpu::BufferAsyncError>>>,
+    curve_latest: Option<Vec<u32>>,
+    curve_fresh: bool,
+    curve_analyzed: Option<(EditKey, Option<usize>)>,
+    curve_changed: bool,
 }
 
 impl Renderer {

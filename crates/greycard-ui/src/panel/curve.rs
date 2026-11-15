@@ -185,14 +185,15 @@ pub(crate) fn show_selected(app: &App) {
 }
 
 /// The curve editor's picture: a grid, the histogram behind, the
-/// diagonal, the channel's curve and its points, 256 pixels square, y
+/// diagonal, the channel's curve and its points, 768 pixels square, y
 /// up. For a color curve the line that does nothing is the level one
 /// through the middle, the ground is tinted toward what each way
 /// gives, and the histogram is of lightness. In the parametric mode
 /// it is the parametric curve over the master's ground, its splits
 /// as lines with a handle at the foot of each, and no points.
 pub(crate) fn draw_curve(app: &App, bins: Option<&[u32]>) -> slint::Image {
-    const N: usize = 256;
+    const N: usize = 768;
+    const SCALE: usize = N / 256;
     let parametric = parametric_mode(app).then(|| panel_parametric(app));
     let channel = if parametric.is_some() {
         Channel::Rgb
@@ -209,6 +210,15 @@ pub(crate) fn draw_curve(app: &App, bins: Option<&[u32]>) -> slint::Image {
                 g: rgb[1],
                 b: rgb[2],
             };
+        }
+    };
+    let blend = |px: &mut [slint::Rgb8Pixel], x: usize, y_up: usize, rgb: [u8; 3], alpha: f32| {
+        if x < N && y_up < N && alpha > 0.0 {
+            let a = alpha.clamp(0.0, 1.0);
+            let p = &mut px[(N - 1 - y_up) * N + x];
+            p.r = (p.r as f32 + (rgb[0] as f32 - p.r as f32) * a).round() as u8;
+            p.g = (p.g as f32 + (rgb[1] as f32 - p.g as f32) * a).round() as u8;
+            p.b = (p.b as f32 + (rgb[2] as f32 - p.b as f32) * a).round() as u8;
         }
     };
     for p in px.iter_mut() {
@@ -231,8 +241,9 @@ pub(crate) fn draw_curve(app: &App, bins: Option<&[u32]>) -> slint::Image {
                 [0x04 as f32, 0x0e as f32, 0x34 as f32],
             ),
         };
+        let mid = (N - 1) as f32 / 2.0;
         for y in 0..N {
-            let t = (y as f32 - 127.5) / 127.5;
+            let t = (y as f32 - mid) / mid;
             let tint = if t > 0.0 {
                 up.map(|v| v * t)
             } else {
@@ -265,14 +276,27 @@ pub(crate) fn draw_curve(app: &App, bins: Option<&[u32]>) -> slint::Image {
                     at(finish::encode(l * l * l))
                 })
                 .collect();
-            let peak = column[1..N - 1].iter().copied().fold(1.0f32, f32::max);
+            let edge = SCALE;
+            let peak = column[edge..N - edge]
+                .iter()
+                .copied()
+                .fold(1.0f32, f32::max);
             for (x, v) in column.iter().enumerate() {
-                let h = ((v / peak).min(1.0).sqrt() * N as f32).ceil() as usize;
-                for y in 0..h.min(N) {
+                let hf = (v / peak).min(1.0).sqrt() * N as f32;
+                let h = (hf.floor() as usize).min(N);
+                let frac = hf - h as f32;
+                for y in 0..h {
                     let p = &mut px[(N - 1 - y) * N + x];
                     p.r = p.r.saturating_add(0x1c);
                     p.g = p.g.saturating_add(0x1c);
                     p.b = p.b.saturating_add(0x1c);
+                }
+                if h < N && frac > 0.0 {
+                    let add = (0x1c as f32 * frac).round() as u8;
+                    let p = &mut px[(N - 1 - h) * N + x];
+                    p.r = p.r.saturating_add(add);
+                    p.g = p.g.saturating_add(add);
+                    p.b = p.b.saturating_add(add);
                 }
             }
         } else {
@@ -293,14 +317,35 @@ pub(crate) fn draw_curve(app: &App, bins: Option<&[u32]>) -> slint::Image {
                 .unwrap_or(1)
                 .max(1) as f32;
             for x in 0..N {
+                let u = x as f32 / (N - 1) as f32 * 255.0;
+                let b0 = (u as usize).min(254);
+                let f = u - b0 as f32;
                 for (c, color) in &channels {
-                    let h = ((bins[c * 256 + x] as f32 / peak).min(1.0).sqrt() * N as f32).ceil()
-                        as usize;
-                    for y in 0..h.min(N) {
+                    let v0 = bins[c * 256 + b0] as f32;
+                    let v1 = bins[c * 256 + b0 + 1] as f32;
+                    let v = v0 + f * (v1 - v0);
+                    let hf = (v / peak).min(1.0).sqrt() * N as f32;
+                    let h = (hf.floor() as usize).min(N);
+                    let frac = hf - h as f32;
+                    for y in 0..h {
                         let p = &mut px[(N - 1 - y) * N + x];
                         p.r = p.r.max(color[0]);
                         p.g = p.g.max(color[1]);
                         p.b = p.b.max(color[2]);
+                    }
+                    if h < N && frac > 0.0 {
+                        let p = &mut px[(N - 1 - h) * N + x];
+                        let top = [
+                            (p.r as f32 + (color[0].saturating_sub(p.r)) as f32 * frac).round()
+                                as u8,
+                            (p.g as f32 + (color[1].saturating_sub(p.g)) as f32 * frac).round()
+                                as u8,
+                            (p.b as f32 + (color[2].saturating_sub(p.b)) as f32 * frac).round()
+                                as u8,
+                        ];
+                        p.r = p.r.max(top[0]);
+                        p.g = p.g.max(top[1]);
+                        p.b = p.b.max(top[2]);
                     }
                 }
             }
@@ -308,60 +353,111 @@ pub(crate) fn draw_curve(app: &App, bins: Option<&[u32]>) -> slint::Image {
     }
     // Grid at the quarters, and the line that does nothing: the
     // diagonal, or the level line for a color curve.
+    let quarters = [N / 4, N / 2, 3 * N / 4];
     for i in 0..N {
-        for q in [64, 128, 192] {
-            paint(px, i, q, [0x24, 0x24, 0x24]);
-            paint(px, q, i, [0x24, 0x24, 0x24]);
+        for q in quarters {
+            for w in 0..SCALE {
+                paint(px, i, q + w - SCALE / 2, [0x24, 0x24, 0x24]);
+                paint(px, q + w - SCALE / 2, i, [0x24, 0x24, 0x24]);
+            }
         }
         if channel.is_color() {
-            paint(px, i, 128, [0x3a, 0x3a, 0x3a]);
-        } else {
-            paint(px, i, i, [0x2c, 0x2c, 0x2c]);
+            for w in 0..SCALE {
+                paint(px, i, N / 2 + w - SCALE / 2, [0x3a, 0x3a, 0x3a]);
+            }
+        }
+    }
+    if !channel.is_color() {
+        let diag_r = SCALE as f32 * 0.45;
+        let reach = (diag_r + 1.5).ceil() as isize;
+        for i in 0..N {
+            let y0 = (i as isize - reach).max(0) as usize;
+            let y1 = (i as isize + reach).min(N as isize - 1) as usize;
+            for y in y0..=y1 {
+                let d = (y as f32 - i as f32).abs() * std::f32::consts::FRAC_1_SQRT_2;
+                let a = (diag_r + 0.5 - d).clamp(0.0, 1.0);
+                blend(px, i, y, [0x2c, 0x2c, 0x2c], a);
+            }
         }
     }
     // The splits of the parametric curve: a line each, under the
     // curve.
     if let Some(p) = &parametric {
         for s in p.ordered_splits() {
-            let x = (s * (N - 1) as f32).round() as usize;
-            for y in 0..N {
-                paint(px, x, y, [0x44, 0x44, 0x44]);
+            let x = (s * (N - 1) as f32).round() as isize;
+            for dx in -(SCALE as isize / 2)..=(SCALE as isize / 2) {
+                let xi = x + dx;
+                if xi >= 0 && (xi as usize) < N {
+                    for y in 0..N {
+                        paint(px, xi as usize, y, [0x44, 0x44, 0x44]);
+                    }
+                }
             }
         }
     }
-    // The curve, two pixels thick, joined between samples.
+    // The curve, anti-aliased across its perpendicular thickness.
     let color = match channel {
         Channel::Red => [0xe8, 0x60, 0x60],
         Channel::Green => [0x60, 0xe0, 0x60],
         Channel::Blue => [0x60, 0x98, 0xf0],
         _ => [0xd8, 0xd8, 0xd8],
     };
-    let sample = |x: usize| {
-        let at = x as f32 / (N - 1) as f32;
+    let sample_f = |x: f32| {
+        let at = (x / (N - 1) as f32).clamp(0.0, 1.0);
         let y = match &parametric {
             Some(p) => p.at(at),
             None => curve::evaluate(&points, at),
         };
-        (y * (N - 1) as f32).round() as usize
+        y * (N - 1) as f32
     };
+    let ys: Vec<f32> = (0..N).map(|x| sample_f(x as f32)).collect();
+    let half_w = SCALE as f32 * 0.85;
+    let margin = (half_w + 1.5).ceil() as isize;
     for x in 0..N {
-        let y0 = sample(x);
-        let y1 = if x + 1 < N { sample(x + 1) } else { y0 };
-        let (lo, hi) = (y0.min(y1), y0.max(y1));
+        let y_curr = ys[x];
+        let y_prev = if x > 0 { ys[x - 1] } else { y_curr };
+        let y_next = if x + 1 < N { ys[x + 1] } else { y_curr };
+        let y_min = y_curr.min(y_prev).min(y_next);
+        let y_max = y_curr.max(y_prev).max(y_next);
+        let lo = ((y_min.floor() as isize) - margin).max(0) as usize;
+        let hi = ((y_max.ceil() as isize) + margin).min(N as isize - 1) as usize;
+        let seg_dist = |ax: f32, ay: f32, bx: f32, by: f32, px_f: f32, py_f: f32| -> f32 {
+            let (vx, vy) = (bx - ax, by - ay);
+            let len2 = vx * vx + vy * vy;
+            let t = if len2 > 1e-6 {
+                ((px_f - ax) * vx + (py_f - ay) * vy) / len2
+            } else {
+                0.0
+            }
+            .clamp(0.0, 1.0);
+            let (cx, cy) = (ax + t * vx, ay + t * vy);
+            ((px_f - cx).powi(2) + (py_f - cy).powi(2)).sqrt()
+        };
+        let xf = x as f32;
         for y in lo..=hi {
-            paint(px, x, y, color);
-            paint(px, x, y + 1, color);
+            let yf = y as f32;
+            let mut d = (yf - y_curr).abs();
+            if x > 0 {
+                d = d.min(seg_dist(xf - 1.0, y_prev, xf, y_curr, xf, yf));
+            }
+            if x + 1 < N {
+                d = d.min(seg_dist(xf, y_curr, xf + 1.0, y_next, xf, yf));
+            }
+            let a = (half_w + 0.5 - d).clamp(0.0, 1.0);
+            blend(px, x, y, color, a);
         }
     }
     if let Some(p) = &parametric {
         // The split handles: a triangle at the foot of each line, its
         // apex up, with a dark rim.
-        for s in p.ordered_splits() {
-            let cx = (s * (N - 1) as f32).round() as i32;
-            for y in 0..=8i32 {
-                let half = 8 - y;
+        let s = SCALE as i32;
+        let top = 8 * s;
+        for split in p.ordered_splits() {
+            let cx = (split * (N - 1) as f32).round() as i32;
+            for y in 0..=top {
+                let half = top - y;
                 for dx in -half..=half {
-                    let rim = dx.abs() == half || y == 0;
+                    let rim = dx.abs() > half - s || y < s;
                     if cx + dx >= 0 {
                         paint(
                             px,
@@ -378,31 +474,35 @@ pub(crate) fn draw_curve(app: &App, bins: Option<&[u32]>) -> slint::Image {
             }
         }
     } else {
-        // The points: squares with a dark rim; the selected one a
+        // The points: circles with a dark rim; the selected one a
         // size up, ringed in the accent.
+        let s = SCALE as f32;
         let selected = selected_point(app);
         for (i, p) in points.iter().enumerate() {
-            let (cx, cy) = (
-                (p[0] * (N - 1) as f32).round() as i32,
-                (p[1] * (N - 1) as f32).round() as i32,
-            );
-            // Half the square's side, where its rim starts, the rim.
-            let (half, inner, ring): (i32, i32, [u8; 3]) = if selected == Some(i) {
-                (6, 5, [0x6e, 0xa8, 0xff])
+            let (cx, cy) = (p[0] * (N - 1) as f32, p[1] * (N - 1) as f32);
+            // Outer and inner radii (~65% of the former 6s/4s squares), and rim color.
+            let (outer_r, inner_r, ring): (f32, f32, [u8; 3]) = if selected == Some(i) {
+                (3.9 * s, 3.0 * s, [0x6e, 0xa8, 0xff])
             } else {
-                (4, 4, [0x14, 0x14, 0x14])
+                (2.6 * s, 1.85 * s, [0x14, 0x14, 0x14])
             };
-            for dy in -half..=half {
-                for dx in -half..=half {
-                    let rim = dx.abs() >= inner || dy.abs() >= inner;
-                    let (x, y) = (cx + dx, cy + dy);
-                    if x >= 0 && y >= 0 {
-                        paint(
-                            px,
-                            x as usize,
-                            y as usize,
-                            if rim { ring } else { [0xff, 0xff, 0xff] },
-                        );
+            let reach = (outer_r + 1.5).ceil() as i32;
+            let (icx, icy) = (cx.round() as i32, cy.round() as i32);
+            for dy in -reach..=reach {
+                for dx in -reach..=reach {
+                    let (x, y) = (icx + dx, icy + dy);
+                    if x >= 0 && (x as usize) < N && y >= 0 && (y as usize) < N {
+                        let d = ((x as f32 - cx).powi(2) + (y as f32 - cy).powi(2)).sqrt();
+                        let outer_a = (outer_r + 0.5 - d).clamp(0.0, 1.0);
+                        if outer_a > 0.0 {
+                            let inner_a = (inner_r + 0.5 - d).clamp(0.0, 1.0);
+                            let rgb = [
+                                (ring[0] as f32 + (255.0 - ring[0] as f32) * inner_a).round() as u8,
+                                (ring[1] as f32 + (255.0 - ring[1] as f32) * inner_a).round() as u8,
+                                (ring[2] as f32 + (255.0 - ring[2] as f32) * inner_a).round() as u8,
+                            ];
+                            blend(px, x as usize, y as usize, rgb, outer_a);
+                        }
                     }
                 }
             }

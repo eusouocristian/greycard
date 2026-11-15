@@ -679,6 +679,56 @@ fn a_lost_scopes_read_back_is_made_again() {
     assert!(!in_flight);
 }
 
+/// The curve editor's backdrop reads the pre-curve histogram through
+/// `analyze_curve`, so moving a curve point changes the scope's bins
+/// while the curve's own backdrop stays put and dispatches no read
+/// back; an upstream edit such as exposure moves both.
+#[test]
+fn the_curve_backdrop_histogram_ignores_curve_edits() {
+    let Some((device, queue)) = device("the curve backdrop histogram check") else {
+        return;
+    };
+    let image = field();
+    let (w, h) = (image.width, image.height);
+    let mut renderer = Renderer::new(&device, &queue);
+    renderer.upload(&Halves::from_image(&image, None));
+    let mut view = View::blank();
+    view.center = (w as f32 / 2.0, h as f32 / 2.0);
+    view.plane = (w as f32, h as f32);
+    view.frame_size = (w as f32, h as f32);
+
+    let uncurved_scope = gpu_bins(&mut renderer, &view, Scope::Rgb, None);
+    let mut curve_bins = None;
+    for _ in 0..100 {
+        let (bins, in_flight) = renderer.analyze_curve(&view, None);
+        if let Some(b) = bins {
+            curve_bins = Some(b.to_vec());
+        }
+        if !in_flight && curve_bins.is_some() {
+            break;
+        }
+        let _ = renderer.device.poll(gpu::PollType::wait_indefinitely());
+    }
+    let curve_bins = curve_bins.expect("the curve's read back landed");
+    assert_eq!(curve_bins, uncurved_scope, "matches the uncurved histogram");
+
+    // A curve edit shifts the main scope's histogram, while the
+    // pre-curve view's backdrop stays idle and unchanged.
+    let mut curved = view.clone();
+    curved.curves = greycard_edit::Curves {
+        rgb: vec![[0.0, 0.0], [0.5, 0.85], [1.0, 1.0]],
+        ..Default::default()
+    }
+    .bake();
+    let curved_scope = gpu_bins(&mut renderer, &curved, Scope::Rgb, None);
+    assert_ne!(curved_scope, curve_bins, "the scope follows the curve");
+    assert_eq!(
+        renderer.analyze_curve(&view, None),
+        (None, false),
+        "no new curve read back when only the curve moved"
+    );
+}
+
 /// The scopes, the clipping lamps on the histogram's ends, and the
 /// readout under the pointer are of the export space's encoded values
 /// whatever the monitor: a monitor's table, and a soft proof's gamut

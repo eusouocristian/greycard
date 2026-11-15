@@ -160,6 +160,27 @@ impl Scopes {
             usage: gpu::BufferUsages::UNIFORM | gpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let curve_size = (scope::HIST * 4) as u64;
+        let curve_bins = device.create_buffer(&gpu::BufferDescriptor {
+            label: Some("curve scope bins"),
+            size: curve_size,
+            usage: gpu::BufferUsages::STORAGE
+                | gpu::BufferUsages::COPY_SRC
+                | gpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let curve_staging = device.create_buffer(&gpu::BufferDescriptor {
+            label: Some("curve scope staging"),
+            size: curve_size,
+            usage: gpu::BufferUsages::MAP_READ | gpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let curve_mode = device.create_buffer(&gpu::BufferDescriptor {
+            label: Some("curve scope mode"),
+            size: 32,
+            usage: gpu::BufferUsages::UNIFORM | gpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         Self {
             pipeline,
             layout,
@@ -178,6 +199,15 @@ impl Scopes {
             source_changed: false,
             analyzed: None,
             image_changed: false,
+            curve_bins,
+            curve_staging,
+            curve_mode,
+            curve_analysis: None,
+            curve_in_flight: None,
+            curve_latest: None,
+            curve_fresh: false,
+            curve_analyzed: None,
+            curve_changed: false,
         }
     }
 }
@@ -203,6 +233,9 @@ impl Renderer {
         scope: Scope,
         weigh_by: Option<usize>,
     ) -> (Option<(Scope, &[u32])>, bool) {
+        if self.scopes.image_changed {
+            self.scopes.curve_changed = true;
+        }
         self.sync_sample(v);
         let weigh_by = weigh_by.filter(|&k| k < v.locals.len().min(MAX_LOCALS));
         // Collect a finished read back, or let a lost one go and
@@ -441,6 +474,147 @@ impl Renderer {
                 None
             },
             self.scopes.in_flight.is_some() || self.scopes.picture_in_flight.is_some(),
+        )
+    }
+
+    /// The pre-curve histogram for the curve editor's backdrop, under
+    /// `v` (where the edited curve has been replaced with the identity).
+    /// Keyed on `v` and `weigh_by`, so moving curve points or splits
+    /// neither dispatches a read back nor shifts the backdrop.
+    pub fn analyze_curve(&mut self, v: &View, weigh_by: Option<usize>) -> (Option<&[u32]>, bool) {
+        if self.scopes.image_changed {
+            self.scopes.curve_changed = true;
+        }
+        self.sync_sample(v);
+        let weigh_by = weigh_by.filter(|&k| k < v.locals.len().min(MAX_LOCALS));
+        let _ = crate::lost::poll(&self.device, gpu::PollType::Poll);
+        let bins = self.scopes.curve_in_flight.as_ref().map(|rx| rx.try_recv());
+        if let Some(Err(TryRecvError::Disconnected)) = bins {
+            self.scopes.curve_in_flight = None;
+            unmap_lost(&self.device, &self.scopes.curve_staging);
+            self.scopes.curve_changed = true;
+        }
+        if let Some(Ok(result)) = bins {
+            self.scopes.curve_in_flight = None;
+            if result.is_ok()
+                && let Some((_, weighed)) = self.scopes.curve_analyzed
+                && let Some(t) = &self.scopes.curve_analysis
+                && let Ok(data) = self.scopes.curve_staging.slice(..).get_mapped_range()
+            {
+                let mut bins = bytemuck::cast_slice::<u8, u32>(&data)[..scope::HIST].to_vec();
+                drop(data);
+                if weighed.is_some() {
+                    scope::normalize(&mut bins, (t.width() * t.height()) as usize);
+                }
+                self.scopes.curve_latest = Some(bins);
+                self.scopes.curve_fresh = true;
+            }
+            self.scopes.curve_staging.unmap();
+        }
+        let key = (EditKey::of(v), weigh_by);
+        let stale = self.scopes.curve_changed || self.scopes.curve_analyzed.as_ref() != Some(&key);
+        if stale && self.scopes.curve_in_flight.is_none() && self.source.is_some() {
+            self.scopes.curve_analyzed = Some(key);
+            self.scopes.curve_changed = false;
+            let (iw, ih) = (
+                v.frame_size.0.max(1.0) as u32,
+                v.frame_size.1.max(1.0) as u32,
+            );
+            let height = (ANALYSIS_WIDTH * ih / iw).max(1);
+            let analysis = match &self.scopes.curve_analysis {
+                Some(t) if t.height() == height => t.clone(),
+                _ => {
+                    let t = self.make_target("curve analysis", ANALYSIS_WIDTH, height);
+                    self.scopes.curve_analysis = Some(t.clone());
+                    t
+                }
+            };
+            let whole = View {
+                zoom: ANALYSIS_WIDTH as f32 / iw as f32,
+                center: (iw as f32 / 2.0, ih as f32 / 2.0),
+                show_mask: None,
+                show_sharpen: false,
+                mask_alone: false,
+                weigh_by,
+                warn: Warn::default(),
+                vignette: v.vignette,
+                grain: v.grain,
+                ..v.clone()
+            };
+            let bytes = (scope::HIST * 4) as u64;
+            self.queue.write_buffer(
+                &self.scopes.curve_mode,
+                0,
+                bytemuck::cast_slice(&[
+                    Scope::Rgb.kind(),
+                    scope::COLUMNS as u32,
+                    scope::WHEEL as u32,
+                    scope::LEVELS as u32,
+                    u32::from(weigh_by.is_some()),
+                    0,
+                    0,
+                    0,
+                ]),
+            );
+            let mut encoder = self
+                .device
+                .create_command_encoder(&gpu::CommandEncoderDescriptor {
+                    label: Some("curve scope"),
+                });
+            self.draw(&mut encoder, &analysis, &whole, false);
+            encoder.clear_buffer(&self.scopes.curve_bins, 0, Some(bytes));
+            {
+                let view = analysis.create_view(&Default::default());
+                let bind_group = self.device.create_bind_group(&gpu::BindGroupDescriptor {
+                    label: Some("curve scope"),
+                    layout: &self.scopes.layout,
+                    entries: &[
+                        gpu::BindGroupEntry {
+                            binding: 0,
+                            resource: gpu::BindingResource::TextureView(&view),
+                        },
+                        gpu::BindGroupEntry {
+                            binding: 1,
+                            resource: self.scopes.curve_bins.as_entire_binding(),
+                        },
+                        gpu::BindGroupEntry {
+                            binding: 2,
+                            resource: self.scopes.curve_mode.as_entire_binding(),
+                        },
+                    ],
+                });
+                let mut pass = encoder.begin_compute_pass(&gpu::ComputePassDescriptor {
+                    label: Some("curve scope"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.scopes.pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(ANALYSIS_WIDTH.div_ceil(16), height.div_ceil(16), 1);
+            }
+            encoder.copy_buffer_to_buffer(
+                &self.scopes.curve_bins,
+                0,
+                &self.scopes.curve_staging,
+                0,
+                bytes,
+            );
+            self.queue.submit(Some(encoder.finish()));
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.scopes
+                .curve_staging
+                .slice(..)
+                .map_async(gpu::MapMode::Read, move |r| {
+                    let _ = tx.send(r);
+                });
+            self.scopes.curve_in_flight = Some(rx);
+        }
+        (
+            if std::mem::take(&mut self.scopes.curve_fresh) {
+                self.scopes.curve_latest.as_deref()
+            } else {
+                None
+            },
+            self.scopes.curve_in_flight.is_some(),
         )
     }
 

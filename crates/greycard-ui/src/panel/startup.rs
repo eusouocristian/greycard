@@ -1650,11 +1650,31 @@ pub(crate) fn main() -> Result<std::process::ExitCode> {
                         .filter(|&k| view.locals.get(k).is_some_and(|l| !l.mask.is_empty()));
                     app.set_scope_mask_active(selection.is_some());
                     let weigh_by = selection.filter(|_| app.get_scope_selection());
-                    let (bins, in_flight) = renderer.analyze(&view, st.develop.scope, weigh_by);
-                    let fresh = bins.map(|(_, b)| b.to_vec());
+                    let mut curve_view = view.clone();
+                    match st.develop.target {
+                        Some(k) => {
+                            if let (Some(local), Some(adj)) =
+                                (curve_view.locals.get_mut(k), edit.adjustments.get(k))
+                            {
+                                local.baked.curves =
+                                    greycard_edit::Curves::default().bake_with(&adj.look.grading);
+                            }
+                        }
+                        None => {
+                            curve_view.curves =
+                                greycard_edit::Curves::default().bake_with(&edit.grading);
+                        }
+                    }
+                    let (bins, scope_in_flight) =
+                        renderer.analyze(&view, st.develop.scope, weigh_by);
                     if let Some((taken, bins)) = bins {
                         app.set_scope_picture(scope::draw(taken, bins));
+                        clipping_read(&app, bins);
                     }
+                    let (curve_bins, curve_in_flight) =
+                        renderer.analyze_curve(&curve_view, weigh_by);
+                    let in_flight = scope_in_flight || curve_in_flight;
+                    let fresh = curve_bins.map(|b| b.to_vec());
                     let picture = renderer.take_navigator();
                     let new_picture = picture.is_some();
                     if let Some(picture) = picture {
@@ -2021,14 +2041,10 @@ fn said(claimed: instance::Claimed) -> Option<instance::Instance> {
     }
 }
 
-/// A histogram read back from the analysis: the backdrop of the curve
-/// editor, whichever look it edits, and the clipping lamps at the
-/// histogram's corners. A mask's raster landing, or a new weighing,
-/// changes the analysis's key, so it comes this way with no touch of
-/// the panel.
-pub(crate) fn bins_read(st: &mut State, app: &App, bins: Vec<u32>) {
-    app.set_curve_image(draw_curve(app, Some(bins.as_slice())));
-    let clipping = scope::Clipping::of(&bins);
+/// The clipping lamps at the scope histogram's corners, read from the
+/// scope's own output bins.
+pub(crate) fn clipping_read(app: &App, bins: &[u32]) {
+    let clipping = scope::Clipping::of(bins);
     let mark = |chans: [bool; 3]| {
         let c = scope::Clipping::mark(chans).unwrap_or([0; 3]);
         slint::Color::from_rgb_u8(c[0], c[1], c[2])
@@ -2037,6 +2053,14 @@ pub(crate) fn bins_read(st: &mut State, app: &App, bins: Vec<u32>) {
     app.set_clip_shadows_mark(mark(clipping.shadows));
     app.set_clip_highlights_lit(clipping.highlights.iter().any(|&c| c));
     app.set_clip_highlights_mark(mark(clipping.highlights));
+}
+
+/// A pre-curve histogram read back from the analysis: the backdrop of
+/// the curve editor, whichever look it edits. A mask's raster landing,
+/// or a new weighing, changes the analysis's key, so it comes this way
+/// with no touch of the panel.
+pub(crate) fn bins_read(st: &mut State, app: &App, bins: Vec<u32>) {
+    app.set_curve_image(draw_curve(app, Some(bins.as_slice())));
     st.develop.bins = Some(bins);
 }
 
